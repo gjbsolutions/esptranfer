@@ -1,7 +1,7 @@
 # espnow_bridge_main.py  --  ESP32-C3, MicroPython. Same file on BOTH boards.
 # Copy to the board as main.py, together with fastusb.py.
 #
-# Transparent bridge between the PC web app (filexfer.html) and ESP-NOW:
+# Transparent bridge between the PC web app (index.html) and ESP-NOW:
 #   PC -> board : frames to broadcast over ESP-NOW (and radio settings)
 #   board -> PC : every received ESP-NOW packet (+RSSI), TX-done markers, stats
 # All file-transfer logic (chunking, ACK/retransmit, CRC) lives in the web app.
@@ -26,7 +26,7 @@ import network
 import espnow
 import fastusb
 
-#guard
+# 5 s window to interrupt with Ctrl+C before kbd_intr() disables it below.
 time.sleep(5)
 
 micropython.kbd_intr(-1)    # binary data may contain 0x03; never raise KeyboardInterrupt
@@ -35,6 +35,7 @@ BCAST = b'\xff' * 6
 USB_SPIN = 150000           # ~10 ms of busy-wait per USB write before giving up
 MUTE_MS = 100               # after a failed USB write (no host), skip USB this long
 STATS_MS = 500
+READ_TIMEOUT_MS = 200       # max wait for the rest of a USB frame
 PHY_CODES = {1: 0x00, 2: 0x01, 3: 0x03, 4: 0x2A}   # wifi_phy_rate_t values
 
 sta = network.WLAN(network.STA_IF)
@@ -101,11 +102,16 @@ def forward(mac, msg):
 
 
 def read_exact(n):
+    # False if the host stops mid-frame, so a truncated frame cannot stall the main loop.
     got = 0
+    t = time.ticks_ms()
     while got < n:
         k = rd.readinto(inmv[got:n])
         if k:
             got += k
+        elif time.ticks_diff(time.ticks_ms(), t) > READ_TIMEOUT_MS:
+            return False
+    return True
 
 
 def apply_cfg(phy, pwr, ch):
@@ -136,15 +142,15 @@ def send_radio(mv):
 
 
 def handle_usb():
-    read_exact(1)
-    if inb[0] != 0xA5:
+    if not read_exact(1) or inb[0] != 0xA5:
         return                      # resync: drop byte
-    read_exact(2)
+    if not read_exact(2):
+        return
     t = inb[0]
     n = inb[1]
-    if n:
-        read_exact(n)
-    if t == 1 and n:
+    if n and not read_exact(n):
+        return
+    if t == 1 and 0 < n <= 250:
         send_radio(inmv[:n])
     elif t == 2 and n >= 3:
         apply_cfg(inb[0], inb[1], inb[2])
@@ -181,13 +187,10 @@ while True:
             mac, msg = e.irecv(1)
             if msg:
                 forward(mac, msg)
-    except ValueError:
-        pass
-    except OSError:
-        pass
+    except Exception:
+        pass                        # never let the bridge die; keep forwarding
 
     now = time.ticks_ms()
     if time.ticks_diff(now, last_stats) >= STATS_MS:
         last_stats = now
         send_stats(now)
-
