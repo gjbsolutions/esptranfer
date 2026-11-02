@@ -1,5 +1,5 @@
 # lr2021_bridge_main.py  --  ESP32-C3 + LR2021 (FLRC), MicroPython. Same file on BOTH boards.
-# Copy to the board as main.py, together with fastusb.py (unchanged).
+# Copy to the board as main.py, together with fastusb.py.
 #
 # FIXED radio setup: 868.000 MHz, FLRC 325 kbps / 357 kHz, CR 3/4, Gaussian BT 0.5,
 # 32-bit syncword, CRC16, fixed 255-byte packets.
@@ -22,7 +22,7 @@ import machine
 from machine import SPI, Pin
 import fastusb
 
-
+# 5 s window to interrupt with Ctrl+C before kbd_intr() disables it below.
 time.sleep(5)
 
 micropython.kbd_intr(-1)
@@ -64,6 +64,7 @@ IRQ_MASK = IRQ_RX_DONE | IRQ_TX_DONE | IRQ_TIMEOUT | IRQ_CRC | IRQ_LEN
 USB_SPIN = 150000
 MUTE_MS = 20
 STATS_MS = 500
+READ_TIMEOUT_MS = 200       # max wait for the rest of a USB frame
 TX_TIMEOUT_MS = 1500
 
 
@@ -120,7 +121,7 @@ _clr = bytearray(b'\x01\x16\x00\x00\x00\x00')
 _ftx        = bytearray(2 + FRAME_LEN)
 _ftx[1]     = 0x02
 _ftx_mv     = memoryview(_ftx)
-_ZERO       = bytes(FRAME_LEN)
+_ZERO_MV    = memoryview(bytes(FRAME_LEN))
 
 _ftx_rx     = bytearray(2 + FRAME_LEN)
 _ftx_rx[1]  = 0x01
@@ -140,7 +141,7 @@ def fifo_write_and_tx(pl):
     n = len(pl)
     _ftx[2] = n
     _ftx_mv[3:3 + n] = pl
-    _ftx_mv[3 + n:] = _ZERO[:FRAME_LEN - 1 - n]
+    _ftx_mv[3 + n:] = _ZERO_MV[:FRAME_LEN - 1 - n]
     _cmd(_ftx)
     _cmd(_SETTX)
 
@@ -366,22 +367,27 @@ def radio_poll():
 
 # ---------------- USB in ----------------
 def read_exact(n):
+    # False if the host stops mid-frame, so a truncated frame cannot stall the main loop.
     got = 0
+    t = time.ticks_ms()
     while got < n:
         k = rd_in.readinto(inmv[got:n])
         if k:
             got += k
+        elif time.ticks_diff(time.ticks_ms(), t) > READ_TIMEOUT_MS:
+            return False
+    return True
 
 
 def handle_usb():
-    read_exact(1)
-    if inb[0] != 0xA5:
+    if not read_exact(1) or inb[0] != 0xA5:
+        return                      # resync: drop byte
+    if not read_exact(2):
         return
-    read_exact(2)
     t = inb[0]
     n = inb[1]
-    if n:
-        read_exact(n)
+    if n and not read_exact(n):
+        return
     if t == 1 and 0 < n <= MAX_PL:
         if len(tx_q) >= 24:
             tx_q.pop(0)
@@ -408,7 +414,7 @@ while True:
             handle_usb()
             k += 1
         radio_poll()
-    except (OSError, ValueError):
+    except Exception:
         recover()
 
     now = time.ticks_ms()
