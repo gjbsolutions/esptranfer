@@ -1,7 +1,7 @@
 # llcc68_bridge_main.py  --  ESP32-C3 + LLCC68 (GFSK), MicroPython. Same file on BOTH boards.
-# Copy to the board as main.py, together with fastusb.py (unchanged).
+# Copy to the board as main.py, together with fastusb.py.
 #
-# Drop-in replacement for espnow_bridge_main.py. Same USB framing, so the web app keeps working.
+# Same USB framing as the other bridges, so the same web app (index.html) drives it.
 #
 # PC -> board frame (stdin):   [0xA5][type][n][payload n bytes]
 #   type 1 = TX     : payload (1..250 bytes) is transmitted as one GFSK packet
@@ -24,9 +24,12 @@ import machine
 from machine import SPI, Pin
 import fastusb
 
+# 5 s window to interrupt with Ctrl+C before kbd_intr() disables it below.
+time.sleep(5)
+
 micropython.kbd_intr(-1)
 
-# ---------------- pins (same as your TX script) ----------------
+# ---------------- pins ----------------
 spi = SPI(1, baudrate=8000000, polarity=0, phase=0, bits=8, firstbit=SPI.MSB,
           sck=Pin(4), mosi=Pin(6), miso=Pin(5))
 cs = Pin(7, Pin.OUT, value=1)
@@ -61,6 +64,7 @@ IRQ_MASK = 0x0243           # TxDone | RxDone | CrcErr | Timeout
 USB_SPIN = 150000
 MUTE_MS = 100
 STATS_MS = 500
+READ_TIMEOUT_MS = 200       # max wait for the rest of a USB frame
 TX_TIMEOUT_MS = 1500
 
 
@@ -254,7 +258,7 @@ def finish_tx(ok):
     enter_rx()                          # chip is in standby here: TXEN off first, then RXEN on
     tx_cnt = (tx_cnt + 1) & 0xFFFF
     struct.pack_into('<H', tdf, 4, tx_cnt)
-    usb_send(tdf)                       # may spin up to ~10 ms; must not delay the switch back
+    usb_send(tdf)                       # after enter_rx(): the USB write may spin ~10 ms
 
 
 def recover():
@@ -336,23 +340,28 @@ def radio_poll():
 
 # ---------------- USB in ----------------
 def read_exact(n):
+    # False if the host stops mid-frame, so a truncated frame cannot stall the main loop.
     got = 0
+    t = time.ticks_ms()
     while got < n:
         k = rd.readinto(inmv[got:n])
         if k:
             got += k
+        elif time.ticks_diff(time.ticks_ms(), t) > READ_TIMEOUT_MS:
+            return False
+    return True
 
 
 def handle_usb():
     global pend_cfg
-    read_exact(1)
-    if inb[0] != 0xA5:
+    if not read_exact(1) or inb[0] != 0xA5:
+        return                      # resync: drop byte
+    if not read_exact(2):
         return
-    read_exact(2)
     t = inb[0]
     n = inb[1]
-    if n:
-        read_exact(n)
+    if n and not read_exact(n):
+        return
     if t == 1 and 0 < n <= MAX_PL:
         if len(tx_q) >= 24:
             tx_q.pop(0)
@@ -380,7 +389,7 @@ while True:
             handle_usb()
             k += 1
         radio_poll()
-    except (OSError, ValueError):
+    except Exception:
         recover()
 
     now = time.ticks_ms()
